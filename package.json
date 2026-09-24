@@ -1,0 +1,21 @@
+{
+  "name": "sit-dekt-free-slots",
+  "version": "1.0.0",
+  "private": true,
+  "description": "上海应用技术大学「第二课堂 × 课表空闲时段表」生成器：自动连校园 VPN、抓活动与课表、生成彩色 HTML",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "daily-dekt.js",
+  "scripts": {
+    "start": "node daily-dekt.js",
+    "headless": "node daily-dekt.js --no-open",
+    "vpn:check": "python vpn-autologin.py --check-only",
+    "vpn:inspect": "python vpn-inspect.py"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "puppeteer-core": "^24.0.0"
+  }
+}

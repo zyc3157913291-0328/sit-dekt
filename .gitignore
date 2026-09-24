@@ -1,0 +1,46 @@
+# ============================================================
+#  本仓库只放程序代码。
+#  以下内容一律不进版本库 —— 尤其是个人学业数据。
+# ============================================================
+
+# ---- 个人数据：课表与教务接口原始响应 ----
+# kb-raw.json 里有学号、姓名、班级、专业和完整课表，绝不能上传
+kb-raw.json
+课表-*.csv
+课表-*.txt
+调休停课-*.csv
+第二课堂-评分规则.md
+
+# ---- 本机私有配置：学号密码、各程序路径 ----
+config.local.json
+*.local.json
+
+# ---- 运行产物 ----
+daily-result.txt
+login-result.txt
+tables/
+profile/
+code.txt
+code.txt.waiting
+captcha.png
+ocr-code.txt
+need-code.flag
+
+# ---- 开发期探索遗留（截图、一次性探针脚本等）----
+_archive/
+
+# ---- 打包产物 ----
+release/
+
+# ---- 依赖 ----
+node_modules/
+__pycache__/
+*.pyc
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 临时备份 ----
+*.bak
