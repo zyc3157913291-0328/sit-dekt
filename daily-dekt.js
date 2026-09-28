@@ -319,7 +319,12 @@ const SLOTS = [
   { key: '7-8', label: '第7-8节', clock: '14:55-16:30', from: 14 * 60 + 55, to: 18 * 60 },
   { key: '9-11', label: '第9-11节', clock: '18:00-20:25', from: 18 * 60, to: 24 * 60 },
 ];
-const WD = ['周一', '周二', '周三', '周四', '周五'];
+// 表头列：周一到周日。
+// 周末必须进表 —— 学期里有「调休上课」，本地课表快照里就有周日课程（2026-09-20 周日 3 门）。
+// 只排周一到周五会让这些课无处显示，更糟的是周末活动不参与冲突判定，会被误报成「可去」。
+const WD = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
+const WEEKEND_IDX = 5;                                  // WD 下标 >= 5 即周末
+const isWeekendWd = (i) => i >= WEEKEND_IDX;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const lines = [];
@@ -799,25 +804,30 @@ async function teardown() {
     log('本周 ' + ymd(mon) + ' ~ ' + ymd(sun) + '（第 ' + weekNo + ' 周）课程数: ' + courses.length + (kbWarn ? '  ⚠ ' + kbWarn : ''));
 
     // ---- 活动归位 ----
-    const inWeek = [], later = [];
+    // inGrid = 进表格的（本周一至周日 且 有对应节次）；later = 下周及以后 / 无对应节次
+    const inGrid = [], later = [];
     for (const a of kept) {
       const st = new Date(a.hdkssj.replace(' ', 'T'));
-      const wdIdx = (st.getDay() + 6) % 7;                     // 0=周一
+      const wdIdx = (st.getDay() + 6) % 7;                     // 0=周一 … 6=周日
       const slot = slotOf(st.getHours() * 60 + st.getMinutes());
-      if (wdIdx > 4 || !slot) { later.push(a); continue; }      // 周末或无对应节次
-      if (ymd(st) < ymd(mon) || ymd(st) > ymd(sun)) { later.push(a); continue; }
-      a._wd = wdIdx; a._slot = slot;
+      if (!slot) { later.push(a); continue; }                  // 无对应节次
+      if (ymd(st) < ymd(mon) || ymd(st) > ymd(sun)) { later.push(a); continue; }   // 下周及以后
+      a._wd = wdIdx; a._slot = slot; a._weekend = isWeekendWd(wdIdx);
+      // 冲突判定一律查课表，周末也查：调休日有课，漏查会把冲突活动当成「可去」。
       a._conflict = courses.some((c) => c.wd === WD[wdIdx] && c.slot === slot);
-      inWeek.push(a);
+      inGrid.push(a);
     }
-    log('本周可去活动: ' + inWeek.length + '（其中与课程冲突 ' + inWeek.filter((a) => a._conflict).length + '），本周外/周末: ' + later.length);
+    const weekdayActs = inGrid.filter((a) => !a._weekend);
+    const weekendActs = inGrid.filter((a) => a._weekend);
+    log('本周可去活动: ' + inGrid.length + '（周一至周五 ' + weekdayActs.length + ' / 周末 ' + weekendActs.length +
+        '；其中与课程冲突 ' + inGrid.filter((a) => a._conflict).length + '），下周及以后/无节次: ' + later.length);
 
     // ---- 渲染 HTML ----
     const stamp = ymd(now).replace(/-/g, '') + '-' + pad(now.getHours()) + pad(now.getMinutes());
     const out = path.join(TABLES, '第二课堂空闲-' + stamp + '.html');
     const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
     const cellCourses = (wd, slot) => courses.filter((c) => c.wd === wd && c.slot === slot);
-    const cellActs = (wd, slot) => inWeek.filter((a) => a._wd === WD.indexOf(wd) && a._slot === slot);
+    const cellActs = (wd, slot) => inGrid.filter((a) => a._wd === WD.indexOf(wd) && a._slot === slot);
 
     // 每列状态：已过 / 今天 / 未来 —— 表头与整列底色据此区分。
     // 按本地日期比较（ymd 用本地时区），所以「今天」与用户看到的一致。
@@ -831,10 +841,15 @@ async function teardown() {
     h.push(`body{font-family:"Microsoft YaHei",system-ui,sans-serif;margin:24px;background:#f1f5f9;color:#0f172a}
 h1{font-size:20px;margin:0 0 4px}
 .sub{color:#475569;font-size:13px;margin-bottom:16px}
-table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.12)}
-th,td{border:1px solid #cbd5e1;padding:8px 10px;vertical-align:top;font-size:13px}
+/* 固定表格布局 + colgroup 定宽：时间列固定，7 个日期列**等分剩余宽度**。
+   原先 auto 布局下宽度由内容多寡决定 —— 课少的周五被挤到一百来像素，课名全成竖条。
+   空间不够时靠**换行把行撑高**，而不是把列压窄：所以这里不加 max-height / nowrap。 */
+table{border-collapse:collapse;width:100%;table-layout:fixed;background:#fff;box-shadow:0 1px 4px rgba(15,23,42,.12)}
+col.c-time{width:98px}
+th,td{border:1px solid #cbd5e1;padding:8px 10px;vertical-align:top;font-size:13px;
+      overflow-wrap:anywhere;word-break:break-word}
 th{background:#1e293b;color:#fff;font-weight:600;text-align:center}
-td.slot{background:#e2e8f0;font-weight:600;text-align:center;white-space:nowrap;width:118px}
+td.slot{background:#e2e8f0;font-weight:600;text-align:center;white-space:nowrap}
 .course{background:#dbeafe;border-left:4px solid #2563eb;border-radius:4px;padding:5px 7px;margin:3px 0}
 .act{background:#dcfce7;border-left:4px solid #16a34a;border-radius:4px;padding:5px 7px;margin:3px 0}
 .act.bad{background:#ffedd5;border-left-color:#ea580c}
@@ -847,6 +862,9 @@ td.slot{background:#e2e8f0;font-weight:600;text-align:center;white-space:nowrap;
 .note li{margin:4px 0}
 .warn{background:#fef3c7;border-color:#f59e0b}
 th .meta{color:rgba(255,255,255,.72)}
+/* 周末两列表头用更深的底色 + 「周末」徽标区分（用户要求：**不要**左侧竖线）。
+   刻意放在 th.past/th.today 之前：已过/今天 的配色优先级更高，周末也要能看出状态。 */
+th.weekend{background:#334155}
 th.past{background:#94a3b8}
 th.today{background:#4338ca}
 td.past{background:#e5e7eb}
@@ -867,10 +885,13 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
 
     if (kbWarn) h.push('<div class="note warn">⚠ ' + esc(kbWarn) + '</div>');
 
-    h.push('<table><thead><tr><th>时间段</th>');
+    // colgroup 定宽：时间列固定，其余 7 个日期列等分剩余宽度（配合 table-layout:fixed）
+    h.push('<table><colgroup><col class="c-time"><col span="7"></colgroup><thead><tr><th>时间段</th>');
     WD.forEach((w, i) => {
       const k = dayKind[i];
-      h.push('<th class="' + k + '">' + w + '<div class="meta">' + dayDate[i] + '</div>' +
+      const cls = k + (isWeekendWd(i) ? ' weekend' : '');
+      h.push('<th class="' + cls + '">' + w + '<div class="meta">' + dayDate[i] + '</div>' +
+        (isWeekendWd(i) ? '<div class="badge">周末</div>' : '') +
         (k === 'past' ? '<div class="badge">已过</div>'
           : k === 'today' ? '<div class="badge">今天</div>' : '') + '</th>');
     });
@@ -880,7 +901,7 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
       for (let wi = 0; wi < WD.length; wi++) {
         const w = WD[wi];
         const cs = cellCourses(w, s.key), as = cellActs(w, s.key);
-        h.push('<td class="' + dayKind[wi] + '">');
+        h.push('<td class="' + dayKind[wi] + (isWeekendWd(wi) ? ' weekend' : '') + '">');
         cs.forEach((c) => h.push('<div class="course"><div class="b">' + esc(c.kcmc) + '</div>' +
           '<div class="meta">' + esc(c.jc) + ' 节 · ' + esc(c.cdmc) + (c.xm ? ' · ' + esc(c.xm) : '') + '</div></div>'));
         as.forEach((a) => h.push('<div class="act' + (a._conflict ? ' bad' : '') + '"><div class="b">' + esc(a.hdmc) + '</div>' +
@@ -893,7 +914,7 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
     }
     h.push('</tbody></table>');
 
-    h.push('<div class="note"><div class="b">本周之外 / 周末的可报名活动（' + later.length + '）</div><ul>');
+    h.push('<div class="note"><div class="b">未排进表格的可报名活动（下周及以后 / 无对应节次）（' + later.length + '）</div><ul>');
     if (!later.length) h.push('<li>无</li>');
     later.slice(0, 40).forEach((a) => h.push('<li>' + esc(a.hdkssj.slice(5, 16)) + ' · ' + esc(a.hdmc) +
       ' · ' + esc(a.hddd || '地点学校另行安排') + ' · ' + esc(a.dlmc + '/' + a.lbmc) + ' · 报名截止 ' + esc((a.hdbmjzsj || '').slice(5, 16)) + '</li>'));
@@ -902,7 +923,9 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
     h.push('<div class="note"><div class="b">口径说明</div><ul>' +
       '<li>活动已过滤：活动时间早于当前、报名已结束、报名已截止的均不列出。</li>' +
       '<li>「可去活动」指落在我空闲时段（该格无课）的活动；与课程同格的活动标为冲突色，仅供参考。</li>' +
-      '<li>只排周一至周五；周末与下周及以后的活动列在下方。</li>' +
+      '<li>表格排<b>周一至周日</b>（含周末）；下周及以后、或无对应节次的活动列在下方。</li>' +
+      '<li>周末列<b>同样查课表</b>：学期里有<b>调休上课</b>，周末可能真有课（本地快照里就有周日课程），' +
+      '所以周末的活动也照常判冲突，不会因为「是周末」就默认空闲。</li>' +
       '<li>列底色：<b>淡灰 = 已过去的日期</b>，<b>靛蓝 = 今天</b>，白色 = 本周尚未到来的日期。</li>' +
       '<li>课表来自本地快照（含国庆调休后的实际日期），活动数据实时抓取。</li></ul></div>');
     h.push('</body></html>');
@@ -923,9 +946,16 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
     fs.writeFileSync(path.join(TABLES, 'last-table.txt'), out, 'utf8');
     tablePath = out;
     // ASCII 摘要：控制台常把中文输出弄成乱码，这行保证 agent 能稳定拿到数字
-    const conflict = inWeek.filter((a) => a._conflict).length;
-    log('SUMMARY kept=' + kept.length + ' inweek=' + inWeek.length + ' conflict=' + conflict +
-        ' free_inweek=' + (inWeek.length - conflict) + ' later=' + later.length + ' removed=' + removed);
+    // 口径：inweek/conflict/free_inweek 只数「周一至周五」；
+    //       weekend/conflict_weekend/free_weekend 数「周六+周日」。
+    //       两者相加才是表格里的全部活动 —— 周末自成一个数，不去稀释 inweek 的历史含义。
+    const conflict = weekdayActs.filter((a) => a._conflict).length;
+    const conflictWeekend = weekendActs.filter((a) => a._conflict).length;
+    log('SUMMARY kept=' + kept.length + ' inweek=' + weekdayActs.length + ' conflict=' + conflict +
+        ' free_inweek=' + (weekdayActs.length - conflict) +
+        ' weekend=' + weekendActs.length + ' conflict_weekend=' + conflictWeekend +
+        ' free_weekend=' + (weekendActs.length - conflictWeekend) +
+        ' later=' + later.length + ' removed=' + removed);
     fs.writeFileSync(RESULT, lines.join('\n') + '\nTABLE=' + out);
     if (!NO_OPEN) openFirefox(out);
     console.log('TABLE=' + out);
