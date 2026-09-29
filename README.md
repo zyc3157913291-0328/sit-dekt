@@ -16,7 +16,9 @@
 - 从教务系统**实时刷新课表**（老师调课、换教室都会反映进来）
 - 求交集，渲染成一张表：课程蓝色、可去活动绿色、与课冲突的活动橙色、空闲灰色
 - 表格里**已过去的日期用淡灰列底、今天用靛蓝列底**，一眼看清哪天是哪天
-- 跑完自己收尾：关掉 VPN、关掉它自己拉起来的 Edge 门户页
+- VPN 登录成功后客户端会自己开一个门户页浏览器（**Edge 或 Chrome 不固定，取决于系统默认浏览器，点「阻止」也拦不住**），脚本在它出现的那一刻就把进程收掉，不留到收尾
+- 跑完自己收尾：关掉 VPN 客户端
+- 生成的表格用**系统默认浏览器**打开，不要求装某一款浏览器
 
 ---
 
@@ -27,7 +29,7 @@
    探测 xg.sit.edu.cn
    不可达 → 检查 VPN 客户端是否已在运行（在运行就不重复启动）
           → 拉起客户端 + 助手脚本自动点「登录」
-          → 自动拒绝「安全提示」（不额外开浏览器）
+          → 点掉「安全提示」的「阻止」，并把客户端仍然拉起的门户浏览器就地收掉
 
 ② 取活动（学工系统 xg.sit.edu.cn）
    CAS 登录：本地 ddddocr 识别验证码，最多 3 轮
@@ -43,8 +45,9 @@
    课表 × 活动 → 彩色 HTML；列底标注 已过 / 今天 / 未到
    → tables/第二课堂空闲-<YYYYMMDD-HHmm>.html
 
-⑤ 收尾
-   Firefox 打开表格 → 关闭 VPN 客户端 → 关闭本次带出的 Edge 门户页
+⑤ 展示与收尾
+   用**系统默认浏览器**打开表格 → 关闭 VPN 客户端
+   （门户浏览器在①里就已收掉，这里只是兜底）
 ```
 
 ---
@@ -57,7 +60,7 @@
 | Node.js ≥ 18 | 主程序 |
 | Python 3 | 助手脚本与课表展开 |
 | Google Chrome | 抓取用（无头模式） |
-| Mozilla Firefox | 展示用（可选，缺失只跳过"打开表格"） |
+| 默认浏览器 | 展示表格用。脚本直接问系统要默认浏览器，不限定是哪一款 |
 | 深信服 EasyConnect | 校园 VPN 客户端 |
 | Python 包 `ddddocr` | 验证码离线识别 |
 
@@ -105,8 +108,8 @@ notepad config.local.json      # 填入你的学号与密码
 ## 运行
 
 ```powershell
-node daily-dekt.js              # 正常跑，结束后用 Firefox 打开表格
-node daily-dekt.js --no-open    # 不打开浏览器（定时任务用）
+node daily-dekt.js              # 正常跑：收尾（关统一认证页 → 关 VPN）之后用系统默认浏览器打开表格
+node daily-dekt.js --no-open    # 不打开浏览器（离线自测、或不想弹窗时用）
 node daily-dekt.js --from-file 活动列表.json --no-open   # 离线自测，跳过网络
 ```
 
@@ -132,12 +135,12 @@ TABLE=<程序目录>\tables\第二课堂空闲-20260924-1230.html
 （`<程序目录>` 就是你放这套程序的地方，例如 `D:\tools\sit-dekt`。
 程序内部所有读写都在这个目录下，不依赖任何绝对路径。）
 
-**DSH 内置 scheduler**：新建任务，提示词里让 agent 运行 `node daily-dekt.js --no-open`，然后读 `daily-result.txt` 贴出 `SUMMARY` 行（**不要**解析 pwsh 控制台输出，中文会乱码）。
+**DSH 内置 scheduler**：新建任务，提示词里让 agent 运行 `node daily-dekt.js`（**不要**加 `--no-open`，表格由脚本自己在最后打开），然后读 `daily-result.txt` 贴出**含 `SUMMARY` 的那一行**（该行行首带时间戳；**不要**解析 pwsh 控制台输出，中文会乱码）。
 
 定时的几点经验：
 
 - 到点时 VPN 大概率是断的，程序会自己连——实测从拉起客户端到隧道就绪约 20 秒
-- 程序跑完会**自动关掉 VPN**。如果那个时间你正用校园网做别的事，设环境变量 `SIT_KEEP_VPN=1`，就只收 Edge 不动 VPN
+- 程序跑完会**自动关掉 VPN**。如果那个时间你正用校园网做别的事，设环境变量 `SIT_KEEP_VPN=1`，就只收门户浏览器不动 VPN
 - 整轮耗时约 2.5 分钟
 
 ---
@@ -149,7 +152,7 @@ TABLE=<程序目录>\tables\第二课堂空闲-20260924-1230.html
 | `SIT_USER` / `SIT_PASS` | 学号密码（优先于 `config.local.json`） | 读文件 |
 | `SIT_HOME` | 数据目录 | 脚本所在目录 |
 | `SIT_CHROME` | Chrome 可执行文件 | 自动探测 |
-| `SIT_FIREFOX` | Firefox 可执行文件 | 自动探测 |
+| `SIT_BROWSER` | 指定用哪个浏览器打开表格（不设则用系统默认浏览器） | 系统默认 |
 | `SIT_PYTHON` | Python 解释器 | 自动探测 Anaconda / PATH |
 | `SIT_SANGFOR` | 深信服客户端路径 | 自动探测 |
 | `SIT_VPN_WAIT_MS` | 等 VPN 就绪上限（毫秒） | 360000（6 分钟） |
@@ -164,7 +167,7 @@ TABLE=<程序目录>\tables\第二课堂空闲-20260924-1230.html
 ```
 daily-dekt.js          主程序：VPN → 取活动 → 刷新课表 → 渲染 → 收尾
 vpn-autologin.py       助手：检测登录框凭据、点「登录」、关「安全提示」
-vpn-teardown.py        收尾：关 VPN 与本次带出的 Edge 门户页
+vpn-teardown.py        清扫/收尾：关门户浏览器（进程级 + 新建窗口级）与 VPN 客户端
 vpn-inspect.py         诊断：只读列出 VPN 客户端所有窗口与可见控件
 build_kebiao.py        把正方「周次课表」展开成「按日期」并套用校历调休
 ocr-captcha.py         用 ddddocr 离线识别验证码
@@ -172,7 +175,7 @@ config.example.json    配置模板 → 复制成 config.local.json
 课表-*.csv / *.txt      课表快照（每次运行自动刷新）
 kb-raw.json            正方课表接口的原始响应
 调休停课-*.csv          校历调休/停课推算结果
-tables/                生成的 HTML 表格（不进版本库）
+tables/                生成的 HTML 表格（不进版本库；自动只留最近 7 天、每天最后一张）
 profile/               Chrome 用户目录，保存 CAS 登录态（不进版本库）
 _archive/              开发期的探索脚本与截图（不进版本库）
 ```
@@ -250,6 +253,26 @@ python vpn-inspect.py          # 列出所有窗口与可见控件
 python vpn-inspect.py --all    # 连隐藏的一起列
 python vpn-autologin.py --check-only   # 只报校园网是否可达
 ```
+
+### 表格没有自动打开 / 弹出了「选取应用」
+
+脚本把表格交给**你当前的默认程序**打开，而且**每次运行都重新问一次系统**，
+所以你把默认浏览器换掉，下一次运行就会跟着变。判断依据是系统自己的解析结果
+（`AssocQueryString` 问 `http` 协议用哪个程序），脚本不读注册表、也不缓存。
+
+看 `daily-result.txt` 末尾那行：
+
+```
+已用系统默认打开方式打开表格（系统默认浏览器（chrome.exe））
+```
+
+- 有这行但没看到窗口 → 多半开在了已有浏览器窗口的新标签里。
+- 出现 `打开表格失败` → 三种方式都没成，按提示手动打开那个文件。
+
+**注意**：有些机器上 `.html` 的**文件关联本身是坏的** —— 双击 `.html` 会弹
+「选取应用」。这种情况下"把文件交给系统打开"是走不通的，所以脚本不依赖它，
+而是先问出默认浏览器再启动。想修关联：Windows 设置 → 应用 → 默认应用 →
+按文件类型 → `.html` 选一个浏览器。
 
 ---
 

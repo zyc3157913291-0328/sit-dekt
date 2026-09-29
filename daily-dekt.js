@@ -6,29 +6,35 @@
  * 环境变量：
  *   SIT_USER / SIT_PASS  学号与密码（也可留空，脚本会回退读 HKCU\Environment）
  *   SIT_HOME             数据目录，默认脚本所在目录（整个文件夹可直接搬走）
- *   SIT_CHROME           浏览器可执行文件（默认自动探测 Chrome/Edge）
+ *   SIT_CHROME           浏览器可执行文件（脚本自己驱动用，默认自动探测 Chrome/Edge）
  *   SIT_PYTHON           Python 解释器（默认自动探测 Anaconda/PATH）
- *   SIT_FIREFOX          Firefox 可执行文件（默认自动探测）
+ *   SIT_BROWSER          指定用哪个程序打开生成的表格（默认交给系统默认打开方式）
  *   SIT_SANGFOR          深信服 VPN 客户端（默认自动探测）
  *   SIT_VPN_WAIT_MS      等 VPN 就绪的上限，默认 6 分钟
  *   SIT_VPN_HELPER       vpn-autologin.py 路径（默认脚本同目录）
  *   SIT_VPN_TEARDOWN     vpn-teardown.py 路径（默认脚本同目录）
- *   SIT_KEEP_VPN         置 1 则收尾时保留 VPN 客户端（仍会收 Edge）
+ *   SIT_KEEP_VPN         置 1 则收尾时保留 VPN 客户端（仍会收门户浏览器）
  *   NODE_PATH / PUPPETEER_CORE_ROOT  puppeteer-core 所在 node_modules（默认自动回退查找）
  *
  * 流程：
+ *   0. 校园网不可达则拉起深信服 VPN。登录成功的那一刻 VPN 会自己开一个门户浏览器
+ *      （实测 Edge 或 Chrome 都有，取决于系统默认浏览器，点「阻止」也拦不住），
+ *      脚本就在那一刻把它收掉，不留到任务收尾
  *   1. 打开 xg.sit.edu.cn，若跳到 CAS 则截验证码 → 等 code.txt → 提交登录
  *   2. 打开 /hdgl/hdydlist，截获 getHdgcHdList.zf 的活动列表
  *   3. 过滤：已过期、报名已结束的一律丢弃
  *   4. 对保留的活动，从列表页 DOM 里读详情页 href，逐条进去取「活动地点」
  *   5. 读取本周课表（本地快照 CSV），与活动按「星期 × 节次」求交
  *   6. 渲染彩色 HTML 表格 → tables/第二课堂空闲-<时间戳>.html
- *   7. 清理 7 天前的旧表
+ *   7. 清理旧表（按**文件名日期**：早于 7 天的删掉，同一天只留最后一张）
+ *      → 收尾（关掉新建的校内认证窗口 → 关 VPN 客户端）
+ *   8. **最后**用系统默认浏览器打开表格（--no-open 可跳过）
+ *      顺序是用户明确要求的：先把环境收干净，再把结果摆到人面前。
  */
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFileSync } = require('child_process');
 
 /**
  * 稳健加载 puppeteer-core：不依赖调用方注入 NODE_PATH，
@@ -110,10 +116,12 @@ const CHROME = pick('SIT_CHROME', 'chrome', [
   'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
   'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
 ]);
-const FIREFOX = pick('SIT_FIREFOX', 'firefox', [
-  'C:\\Program Files\\Mozilla Firefox\\firefox.exe',
-  'C:\\Program Files (x86)\\Mozilla Firefox\\firefox.exe',
-]);
+// 打开表格用哪个程序：留空则交给系统默认打开方式（见 openTable()）。
+// 之所以不再固定 Firefox：用哪个程序是用户自己的偏好，写死它等于要求每台机器都装火狐。
+const BROWSER_OVERRIDE = pick('SIT_BROWSER', 'browser', []);
+// 实测被 VPN 拉起来过的浏览器：Edge 与 Chrome 都出现过（取决于系统默认浏览器），
+// 所以清扫时两个镜像都要认，不能只盯 msedge。
+const BROWSER_IMAGES = ['msedge.exe', 'chrome.exe'];
 const PYTHON = pick('SIT_PYTHON', 'python', [
   'python.exe',                                  // 交给 PATH 解析
   'python3.exe',
@@ -139,6 +147,19 @@ const VPN_HELPER = process.env.SIT_VPN_HELPER || (DIR + 'vpn-autologin.py');
 const VPN_TEARDOWN = process.env.SIT_VPN_TEARDOWN || (DIR + 'vpn-teardown.py');
 // 置 1 则收尾时保留 VPN（只收 Edge）；默认一律关掉
 const KEEP_VPN = !!process.env.SIT_KEEP_VPN;
+
+/**
+ * 窗口基线文件：拉 VPN **之前**把当前可见窗口 dump 到这里。
+ *
+ * 为什么需要它（2026-09-29 实测踩到）：VPN 打开门户页时，如果浏览器已经在跑，
+ * 页面会被交给那个**已存在的**进程 —— 不产生新进程，只多出一个窗口。
+ * 那种情况按进程归因根本看不见它；而按进程杀又会连带杀掉用户自己的窗口。
+ * 有了这份窗口基线，就能只关「本次新出现 **且** 标题像校内门户」的那一个窗口。
+ *
+ * 放临时目录而不是项目目录：定时任务的提示词明确要求不要往项目目录里
+ * 写计划外的文件。
+ */
+const WIN_BASELINE = path.join(os.tmpdir(), 'sit-dekt-windows-' + process.pid + '.json');
 
 // 本学期课表快照（含调休后的实际日期）
 const KB_CSV = DIR + '课表-2026-2027第一学期-按日期.csv';
@@ -241,6 +262,9 @@ async function ensureVpn() {
   if (await reachable(HOST)) return true;
   if (!SANGFOR) { log('校园网不可达，且未找到深信服客户端（可用 SIT_SANGFOR 指定路径）'); return false; }
 
+  // 趁现在留一份窗口基线：再往后客户端随时可能把门户页开出来
+  dumpWindowBaseline();
+
   // 已经在跑就别再拉一个：多开会堆出第二个客户端和第二个登录框，
   // 助手的「点登录」还可能点到废弃的那个窗口上。客户端在跑时只需叫起助手补点登录。
   if (vpnClientRunning()) {
@@ -291,19 +315,25 @@ async function ensureVpn() {
       waited += 10;
       if (await reachable(HOST)) {
         log('VPN 已就绪（共等待 ' + waited + ' 秒）');
-        // 先别急着收掉助手：客户端登录成功后紧接着会弹「安全提示」，问是否允许
-        // 启动 msedge.exe 打开门户页。那个弹窗不会自己消失，得由助手点掉「阻止」，
-        // 否则它会一直挂在屏幕上（也会多开一个浏览器）。等它自己收尾。
-        if (helper) {
-          log('等点登录助手收尾（关掉安全提示）…');
-          // 兜底计时器必须清掉/不持有事件循环，否则它会白白拖住进程几分钟
-          await new Promise((resolve) => {
-            if (helper.exitCode !== null || helper.signalCode !== null) { resolve(); return; }
-            const guard = setTimeout(resolve, 40000);
-            guard.unref?.();
-            helper.once('exit', () => { clearTimeout(guard); resolve(); });
-          });
+        // 客户端登录成功后紧接着会弹「安全提示」，问是否允许启动浏览器打开门户页。
+        // 那个弹窗不会自己消失，得由助手点掉「阻止」；**但实测点「阻止」也拦不住
+        // 浏览器被拉起来**（Edge 或 Chrome，取决于系统默认浏览器），所以还得在它
+        // 出现的那一刻就把进程收掉 —— 用户要求，不要留到任务收尾。
+        //
+        // 这里本来就要等助手收尾（最多 40 秒），把清扫插进这段空等里：
+        // 既不增加总耗时，又能覆盖「浏览器晚几秒才出现」的情况。
+        if (helper && helper.exitCode === null && helper.signalCode === null) {
+          log('等点登录助手收尾（关掉安全提示），同时盯着门户浏览器…');
         }
+        const sweepDeadline = Date.now() + 40000;
+        let sweptTotal = 0;
+        for (;;) {
+          sweptTotal += await sweepSpawnedBrowsers('门户浏览器');
+          const helperGone = !helper || helper.exitCode !== null || helper.signalCode !== null;
+          if (helperGone || Date.now() >= sweepDeadline) break;
+          await sleep(6000);
+        }
+        if (sweptTotal) log('已在打开的那一步收掉门户浏览器 ' + sweptTotal + ' 个');
         return true;
       }
     }
@@ -361,6 +391,56 @@ const slotOf = (min) => { for (const s of SLOTS) if (min >= s.from && min < s.to
 
 /** 本周周一 */
 function mondayOf(d) { const x = new Date(d.getFullYear(), d.getMonth(), d.getDate()); const w = (x.getDay() + 6) % 7; x.setDate(x.getDate() - w); return x; }
+
+/**
+ * 清掉过期的表。
+ *
+ * 两条判据，**都按文件名里的生成时间**（`第二课堂空闲-YYYYMMDD-HHMM.html`）：
+ *   1. 生成日早于「7 天前」→ 过期；
+ *   2. 同一天有多张 → **只留最晚的那一张**。
+ *
+ * 为什么不看 mtime：mtime 会被复制 / 恢复 / 云同步改写。这台机器上就踩过 ——
+ * 21 个 09-21~09-24 的表在从另一台机器恢复时 mtime 全被写成 09-24 19:43，
+ * 「7 天」的时钟被重置，旧表于是永远清不掉。文件名里的日期才是真实生成时间。
+ *
+ * 读不出日期的一律**不动**（宁可留着，也不误删）；本次刚生成的那张也绝不删。
+ *
+ * @param {string} keepPath 本次生成的表格路径（无条件保留）
+ * @returns {{removed:number, kept:number, others:string[]}}
+ */
+function cleanOldTables(keepPath) {
+  const NAME_RE = /^第二课堂空闲-(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})\.html$/;
+  const now = new Date();
+  const cutoff = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 7);
+  const cutoffKey = ymd(cutoff).replace(/-/g, '');   // 形如 20260922
+
+  const rows = [];
+  const others = [];
+  for (const f of fs.readdirSync(TABLES)) {
+    const m = NAME_RE.exec(f);
+    if (!m) {
+      if (/\.html$/i.test(f)) others.push(f);        // 认不出日期的 html：只报告
+      continue;
+    }
+    rows.push({ path: path.join(TABLES, f), day: m[1] + m[2] + m[3], stamp: m[1] + m[2] + m[3] + m[4] + m[5] });
+  }
+
+  // 每天最晚的那一张：同一天只留它
+  const latestOfDay = {};
+  for (const r of rows) {
+    if (!latestOfDay[r.day] || r.stamp > latestOfDay[r.day]) latestOfDay[r.day] = r.stamp;
+  }
+
+  let removed = 0;
+  for (const r of rows) {
+    if (r.path === keepPath) continue;                              // 本次刚生成的，绝不删
+    const tooOld = r.day < cutoffKey;
+    const notLatest = latestOfDay[r.day] !== r.stamp;
+    if (!tooOld && !notLatest) continue;
+    try { fs.unlinkSync(r.path); removed++; } catch (e) { /* 删不掉不算任务失败 */ }
+  }
+  return { removed, kept: rows.length - removed, others };
+}
 
 /** 截取验证码元素到 CAPTCHA 文件 */
 async function grabCaptcha(page) {
@@ -592,13 +672,159 @@ async function refreshKb(page) {
   }
 }
 
-/** 用 Firefox 打开生成的表格 */
-function openFirefox(p) {
+/**
+ * 起一个「脱离父进程」的子进程，失败只记日志、绝不抛出。
+ *
+ * 为什么不能光靠 try/catch：exe 不存在时 `spawn` 并不立刻抛，而是稍后发一个
+ * `error` 事件 —— 没挂监听就成了未捕获异常，会把整个任务打挂。
+ * openTable 跑在任务最后，最不该因为一个打不开的浏览器而崩。
+ *
+ * @returns {boolean} 是否成功交给操作系统启动
+ */
+function spawnDetached(exe, args, what) {
   try {
-    if (!FIREFOX || !fs.existsSync(FIREFOX)) { log('未找到 firefox，跳过打开表格'); return; }
-    spawn(FIREFOX, [p], { detached: true, stdio: 'ignore' }).unref();
-    log('已用 Firefox 打开表格');
-  } catch (e) { log('Firefox 打开失败: ' + e.message); }
+    const p = spawn(exe, args, { detached: true, stdio: 'ignore' });
+    p.on('error', (e) => log(what + '启动失败: ' + e.message));
+    p.unref();
+    return true;
+  } catch (e) {
+    log(what + '启动失败: ' + e.message);
+    return false;
+  }
+}
+
+/**
+ * 用**系统自己的默认打开方式**打开生成的表格。
+ *
+ * 为什么不再自己去解析默认浏览器（2026-09-29 踩坑后改）：
+ * 原先读 `HKCU\...\UrlAssociations\http\UserChoice` 的 ProgId，再按
+ * `HKCR\<ProgId>\shell\open\command` 拼出命令行来启动 —— 那是**重新实现**
+ * Windows 的关联解析，结果和系统真正用的不一致。这台机器上的实测：
+ *
+ *     http\UserChoice             = MSEdgeHTM        → 脚本据此用 Edge
+ *     .html\FileExts\UserChoice   = FirefoxHTML-…    → 又是另一个答案
+ *     问 shell 自己（AssocQueryString）：.html/.htm/http/https 全是 Chrome
+ *
+ * 用户看到的默认浏览器确实是 Chrome，脚本却一直用 Edge 开表格 —— 那两个
+ * 注册表键已经陈旧失配，而 Windows 真正解析时并不采信它们。
+ *
+ * 现在只做一件事：**把文件交给 shell，让它按当前关联去开** —— 和双击这个
+ * 文件走的是同一条路径。不读注册表、不缓存、不猜是哪个浏览器，所以用户
+ * 随时把默认程序换掉，下一次运行立刻跟着变。
+ *
+ * 优先级：显式指定（SIT_BROWSER / config.local.json 的 browser）→ shell。
+ * 显式指定是用户自己写下的选择，不是脚本推断出来的缓存。
+ *
+ * 两个候选都是「交给 shell」，**同步执行并检查退出码**，失败才退下一个：
+ *   PowerShell 的 Start-Process   .NET 的 ShellExecute；路径走**环境变量**传进去
+ *                                （环境块是 UTF-16，不经命令行代码页）。实测
+ *                                `-Command "…" <路径>` 这种尾随参数写法会被拼进
+ *                                命令文本、中文还会乱码，所以不能用那种写法。
+ *   cmd /c start                  经典做法，本机中文路径实测可行；但它要过 cmd
+ *                                 的命令行，换到非中文区域设置时非 ASCII 路径
+ *                                 有被代码页弄坏的理论风险，故排第二。
+ *
+ * （还试过 `explorer.exe <文件>`，实测**静默失败** —— 日志说打开了，文件根本
+ *   没开。别再用它。）
+ */
+function openTable(p) {
+  const cfg = localConfig();
+  if (cfg.firefox && !cfg.browser) {
+    log('提示: config.local.json 里的 firefox 键已不再使用 —— 现在交给系统默认程序；'
+      + '要固定某个程序，请把键名改成 browser');
+  }
+  if (BROWSER_OVERRIDE) {
+    if (fs.existsSync(BROWSER_OVERRIDE)) {
+      if (spawnDetached(BROWSER_OVERRIDE, [p], '指定程序')) {
+        log('已用指定程序打开表格: ' + BROWSER_OVERRIDE);
+        return;
+      }
+    } else {
+      log('指定的程序不存在（' + BROWSER_OVERRIDE + '），改用系统默认打开方式');
+    }
+  }
+  // 交给系统 —— 每次都重新问，永远跟随用户当前的默认程序
+  const how = openViaSystem(p);
+  if (how) log('已用系统默认打开方式打开表格（' + how + '）');
+  else log('打开表格失败：系统默认打开方式没能启动，请手动打开 ' + p);
+}
+
+/**
+ * 用**系统当前**的默认打开方式打开表格 —— 每次运行都重新问系统，不缓存。
+ *
+ * 为什么不能只靠「把文件交给 shell 打开」了事（2026-09-29 实测）：
+ * 这台机器上 `.html` 的**文件关联是坏的** —— ShellExecute（也就是双击）会弹
+ * 「选取应用」对话框：
+ *
+ *     Start-Process -FilePath 表.html   → exit=0，没开任何程序，弹出「选取应用」
+ *     cmd /c start "" 表.html           → exit=0，什么都不做
+ *     explorer.exe 表.html              → 打开了**文件夹**，不是文件
+ *     http\UserChoice 注册表键 = MSEdgeHTM   ← 陈旧值，系统并不采信
+ *     AssocQueryString('http') = Chrome      ← 系统自己真正认的答案
+ *
+ * 所以改成：**用系统自己的解析 API（AssocQueryString）问出默认浏览器，
+ * 每次运行都问一遍，再用它打开**。这不是「读一次、记到本地」——
+ * 用户随时把默认浏览器换成别的，下一次运行立刻跟随。
+ *
+ * 顺序：
+ *   1. 显式指定（SIT_BROWSER / config.local.json 的 browser）
+ *   2. 问系统要默认浏览器（AssocQueryString('http')）→ 用它打开
+ *   3. 交给 shell 直接打开文件（关联健全的机器上这条最干净）
+ *   4. cmd /c start（最后手段）
+ *
+ * 全部**同步**执行并看退出码，成功即止 —— 否则会把表格打开好几次。
+ */
+function openViaSystem(p) {
+  const envWithFile = Object.assign({}, process.env, { SIT_OPEN_FILE: p });
+
+  // 2) 问系统：http 协议用哪个程序打开 —— 那就是用户的默认浏览器
+  //    语句之间必须用 `; ` 连，PowerShell 同一行不认「} 下一条语句」。
+  const psResolve = [
+    '[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)',
+    'Add-Type -Namespace Dsh -Name Assoc -ErrorAction Stop -MemberDefinition '
+      + '\'[DllImport("Shlwapi.dll", CharSet=CharSet.Unicode)] public static extern uint '
+      + 'AssocQueryString(int f, int s, string a, string e, System.Text.StringBuilder o, ref uint n);\'',
+    '$sb = New-Object System.Text.StringBuilder 2048',
+    '$n = [uint32]2048',
+    "$hr = [Dsh.Assoc]::AssocQueryString(0, 2, 'http', 'open', $sb, [ref]$n)",
+    "$exe = if ($hr -eq 0) { $sb.ToString() } else { '' }",
+    'if (-not ($exe -and (Test-Path -LiteralPath $exe))) { exit 3 }',
+    "Start-Process -FilePath $exe -ArgumentList ('\"' + $env:SIT_OPEN_FILE + '\"')",
+    "Write-Output ('default-browser=' + $exe)",
+  ].join('; ');
+  try {
+    const out = execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', psResolve],
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000, env: envWithFile });
+    const m = /default-browser=(.+)/.exec(String(out));
+    return '系统默认浏览器' + (m ? '（' + path.basename(m[1].trim()) + '）' : '');
+  } catch (e) {
+    log('  问系统要默认浏览器没成功: ' + whyOf(e));
+  }
+
+  // 3) 交给 shell 直接打开文件（关联健全时这条最干净）
+  try {
+    execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-Command',
+      'Start-Process -FilePath $env:SIT_OPEN_FILE'],
+      { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], timeout: 30000, env: envWithFile });
+    return '交给 shell 打开文件';
+  } catch (e) {
+    log('  交给 shell 打开文件没成功: ' + whyOf(e));
+  }
+
+  // 4) cmd /c start（要过 cmd 的命令行，非 ASCII 路径有被代码页弄坏的风险，故最后）
+  try {
+    execFileSync('cmd', ['/c', 'start', '', p],
+      { windowsHide: true, stdio: ['ignore', 'ignore', 'pipe'], timeout: 30000 });
+    return 'cmd start';
+  } catch (e) {
+    log('  cmd start 没成功: ' + whyOf(e));
+  }
+  return null;
+}
+
+/** 把子进程失败原因压成一行，便于写进日志。 */
+function whyOf(e) {
+  return String((e && (e.stderr || e.message)) || '').trim().split(/\r?\n/)[0].slice(0, 140);
 }
 
 /** 自归档：脚本直接归档自己这次运行的会话（省掉 agent 编排，零 token） */
@@ -617,31 +843,99 @@ async function selfArchive() {
 }
 
 /**
- * 记录**跑 VPN 之前**就已存在的 Edge 主进程 PID，作为收尾时的基线。
+ * 记录**跑 VPN 之前**就已存在的浏览器 PID，作为归因基线。
  *
- * 这是「不误杀用户浏览器」的关键：收尾脚本只关不在基线里的 msedge 主进程，
+ * 这是「不误杀用户浏览器」的关键：清扫只关不在基线里的进程，
  * 也就是只关本次运行期间才被拉起来的那些。基线必须在拉起客户端**之前**取。
+ *
+ * Edge 与 Chrome 都记 —— 实测 VPN 拉起哪个不固定（取决于系统默认浏览器）。
  */
-function snapshotEdgePids() {
-  try {
-    const out = execSync('tasklist /FI "IMAGENAME eq msedge.exe" /FO CSV /NH',
-      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-    const pids = [];
-    String(out).split(/\r?\n/).forEach((line) => {
-      const m = line.match(/^"msedge\.exe","(\d+)"/i);
-      if (m) pids.push(m[1]);
-    });
-    return pids;
-  } catch { return []; }
+function snapshotBrowserPids() {
+  const pids = [];
+  for (const img of BROWSER_IMAGES) {
+    try {
+      const out = execSync('tasklist /FI "IMAGENAME eq ' + img + '" /FO CSV /NH',
+        { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      String(out).split(/\r?\n/).forEach((line) => {
+        const m = line.match(/^"[^"]+","(\d+)"/i);
+        if (m) pids.push(m[1]);
+      });
+    } catch { /* 该浏览器没在跑，正常 */ }
+  }
+  return pids;
 }
 
-const EDGE_BASELINE = snapshotEdgePids();
+const BROWSER_BASELINE = snapshotBrowserPids();
 
 /**
- * 收尾：关掉 VPN 客户端，以及本次运行带出来的 Edge 门户页。
+ * 把当前可见窗口 dump 成基线，供收尾区分「新窗口」与「本来就开着的窗口」。
  *
- * Edge 部分刻意保守 —— 只有「不在基线里」且「带 VPN 特征」的进程才会被关，
+ * 失败不影响主流程：收尾脚本读不到基线文件时，窗口规则会**整个不启用**
+ * （宁可漏关，也不误关用户本来就开着的窗口）。
+ */
+function dumpWindowBaseline() {
+  if (!PYTHON || !fs.existsSync(VPN_TEARDOWN)) {
+    log('窗口基线: 缺少 Python 或收尾脚本，跳过（窗口规则不启用）');
+    return;
+  }
+  try {
+    execFileSync(PYTHON, [VPN_TEARDOWN, '--dump-windows', WIN_BASELINE],
+      { encoding: 'utf8', windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'], timeout: 30000 });
+    log('窗口基线已采集（拉 VPN 之前）');
+  } catch (e) {
+    log('窗口基线采集失败（窗口规则将不启用）: ' + e.message);
+  }
+}
+
+/**
+ * 「浏览器被 VPN 拉起的那一刻就收掉」。
+ *
+ * 用户明确要求：不要等到任务收尾。VPN 客户端登录成功后，不管「安全提示」点的是
+ * 允许还是阻止，它都会把门户页开起来 —— 所以不能只靠点「阻止」，得真的收掉。
+ *
+ * 复用收尾脚本的浏览器清扫（`--browsers-only`：只收浏览器，绝不动 VPN 客户端），
+ * 让归因规则只有一份实现。`--exclude-cmd` 把我们自己 puppeteer 的 profile 目录
+ * 排除掉：那个浏览器要去访问 xg.sit.edu.cn，命令行天然含校内主机名，
+ * 不排除就会被「命令行含校内主机名」这条规则误杀。
+ *
+ * @returns {Promise<number>} 本次关掉的浏览器个数
+ */
+async function sweepSpawnedBrowsers(tag) {
+  if (!PYTHON || !fs.existsSync(VPN_TEARDOWN)) return 0;
+  return await new Promise((resolve) => {
+    let closed = 0;
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(closed); } };
+    const p = spawn(PYTHON, [VPN_TEARDOWN, '--browsers-only',
+      '--keep', BROWSER_BASELINE.join(','), '--exclude-cmd', PROFILE,
+      '--keep-windows', WIN_BASELINE],
+      { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    // 空转输出（每 6 秒一遍）不刷日志，否则一次运行要刷十几行无信息量的东西。
+    // 闸门推迟时，逐个目标的 skipped_* 也按空转处理 —— 真正的信号是 close_deferred。
+    const NOISE = /^(browsers_none_new|windows_none_new|baseline_browser_pids=.*|window_baseline=.*|window_rule_skipped.*|skipped_(browser|window) .*reason=vpn_window_visible.*|vpn_kept_by_mode.*|sit_windows_left=0|done)$/;
+    const relay = (buf) => String(buf).split(/\r?\n/).forEach((l) => {
+      const t = l.replace(/^VPNTEARDOWN\s*/, '').trim();
+      if (!t || NOISE.test(t)) return;
+      if (/^closed_(browser|window)/.test(t)) closed++;
+      log('  [' + tag + '] ' + t);
+    });
+    p.stdout.on('data', relay);
+    p.stderr.on('data', relay);
+    p.on('error', (e) => { log('  [' + tag + '] 启动失败: ' + e.message); finish(); });
+    const guard = setTimeout(() => { try { p.kill(); } catch { /* 已退出 */ } finish(); }, 60000);
+    guard.unref?.();
+    p.on('close', () => { clearTimeout(guard); finish(); });
+  });
+}
+
+/**
+ * 收尾：关掉 VPN 客户端，以及本次运行带出来的门户浏览器（Edge / Chrome 都算）。
+ *
+ * 浏览器部分刻意保守 —— 只有「不在基线里」且「带 VPN 特征」的进程才会被关，
  * 详细归因规则见 vpn-teardown.py。宁可漏关，也不误杀用户自己开的浏览器。
+ *
+ * 绝大多数情况门户浏览器在 ensureVpn() 里就收掉了（用户要求在它打开的那一刻就关）；
+ * 这里是兜底，负责收掉那之后才冒出来的。
  */
 async function teardown() {
   if (FROM_FILE) { log('收尾: 离线自测模式，跳过'); return; }
@@ -649,8 +943,13 @@ async function teardown() {
     log('收尾: 未找到 Python 或 ' + VPN_TEARDOWN + '，跳过');
     return;
   }
-  log('收尾: 关闭 VPN 与 Edge 门户页（基线 Edge 进程 ' + EDGE_BASELINE.length + ' 个）');
-  const argv = [VPN_TEARDOWN, '--keep', EDGE_BASELINE.join(',')];
+  log('收尾: 关闭 VPN 与门户浏览器（基线浏览器进程 ' + BROWSER_BASELINE.length + ' 个）');
+  // --exclude-cmd：绝不能碰脚本自己 puppeteer 拉起来的那个浏览器 ——
+  // 它要访问 xg.sit.edu.cn，命令行里天然带校内主机名，不排除就会被误杀。
+  // --keep-windows：窗口基线，用来只关「本次新出现的校内门户窗口」。
+  // 没走到 VPN 那一步时这个文件不存在，脚本会自动把窗口规则整个关掉。
+  const argv = [VPN_TEARDOWN, '--keep', BROWSER_BASELINE.join(','), '--exclude-cmd', PROFILE,
+    '--keep-windows', WIN_BASELINE];
   if (KEEP_VPN) argv.push('--keep-vpn');
   await new Promise((resolve) => {
     let done = false;
@@ -933,15 +1232,14 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
     fs.writeFileSync(out, h.join('\n'), 'utf8');
     log('已生成: ' + out);
 
-    // ---- 清理 7 天前 ----
-    const cutoff = Date.now() - 7 * 86400000;
-    let removed = 0;
-    fs.readdirSync(TABLES).forEach((f) => {
-      if (!/^第二课堂空闲-.*\.html$/.test(f)) return;
-      const p = path.join(TABLES, f);
-      try { if (fs.statSync(p).mtimeMs < cutoff) { fs.unlinkSync(p); removed++; } } catch (e) {}
-    });
-    log('清理 7 天前的旧表: ' + removed + ' 个');
+    // ---- 清理过期旧表（按文件名日期；见 cleanOldTables）----
+    const cleanStats = cleanOldTables(out);
+    const removed = cleanStats.removed;
+    log('清理旧表: ' + removed + ' 个（口径: 按文件名日期，只留每天最后一张、保留最近 7 天）'
+      + '；现存 ' + cleanStats.kept + ' 张');
+    if (cleanStats.others.length) {
+      log('  另有 ' + cleanStats.others.length + ' 个认不出日期的 html 未处理（不按规则误删）');
+    }
 
     fs.writeFileSync(path.join(TABLES, 'last-table.txt'), out, 'utf8');
     tablePath = out;
@@ -957,7 +1255,6 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
         ' free_weekend=' + (weekendActs.length - conflictWeekend) +
         ' later=' + later.length + ' removed=' + removed);
     fs.writeFileSync(RESULT, lines.join('\n') + '\nTABLE=' + out);
-    if (!NO_OPEN) openFirefox(out);
     console.log('TABLE=' + out);
   } catch (e) {
     log('ERROR: ' + e.message);
@@ -968,6 +1265,14 @@ td.past .course,td.past .act,td.past .free{opacity:.6}
     // 收尾：把 VPN 与本次带出来的 Edge 门户页清掉（放在重写 RESULT 之前，
     // 这样收尾日志也会进 daily-result.txt，明早排查看得到）
     await teardown();
+    // 窗口基线是一次性的，收尾用完就删（放在临时目录，不留痕）
+    try { fs.unlinkSync(WIN_BASELINE); } catch (e) { /* 没生成或已删，都不是问题 */ }
+    // ---- 真正的最后一步：把生成的表格用系统默认浏览器打开 ----
+    // 放在收尾之后是用户明确要求的顺序：先关掉新建的校内认证窗口、关掉 VPN，
+    // 再把结果摆到人面前。放在这里也顺带保证了「刚打开的这个表格窗口」
+    // 不会被同一轮的清扫误判成门户页（那时候清扫早跑完了）。
+    // 放在重写 RESULT 之前，这样「已用系统默认浏览器打开表格」也会进 daily-result.txt。
+    if (!NO_OPEN && tablePath) openTable(tablePath);
     // 重写结果文件：把自归档结论也带上，让 daily-result.txt 自身完整
     try { fs.writeFileSync(RESULT, lines.join('\n') + (tablePath ? '\nTABLE=' + tablePath : '')); } catch (e) {}
   }
